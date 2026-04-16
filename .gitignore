@@ -1,0 +1,30 @@
+# Runtime outputs (do not commit experiment artifacts)
+results/
+catboost_info/
+*.csv
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Secrets and local config
+.env
+*.pem
+*-key.json
+
+# Local datasets or caches (OpenML/sklearn use user cache by default)
+data/
+*.pkl
+*.pickle
