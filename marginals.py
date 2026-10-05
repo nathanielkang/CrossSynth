@@ -142,6 +142,179 @@ def compute_2way_marginals(X, col_pairs=None, n_bins=10):
     return marginals_2way
 
 
+def column_domain_sizes(shared_edges):
+    """Public per-column domain sizes from the agreed histogram edges.
+
+    ``|dom_i|`` is the number of shared bins. Equal-width columns therefore
+    tie, and pair ranking falls through to column order.
+    """
+    return [max(int(len(edges) - 1), 1) for edges in shared_edges]
+
+
+def select_2way_pairs(n_cols, M=50, selection="domain_size",
+                      domain_sizes=None, rng_seed=42):
+    """Choose up to ``M`` two-way pairs.
+
+    ``domain_size`` ranks pairs by ``|dom_i| * |dom_j|`` ascending and keeps
+    the first ``M``. ``random`` draws ``M`` pairs from a local ``RandomState``
+    so the global NumPy stream used by the one-way noise is left alone.
+    One-way marginals are not returned here; the caller always keeps them.
+    """
+    if n_cols < 2 or M <= 0:
+        return []
+    all_pairs = list(combinations(range(n_cols), 2))
+    if selection == "domain_size":
+        if domain_sizes is None:
+            domain_sizes = [1] * n_cols
+        if len(domain_sizes) != n_cols:
+            raise ValueError("domain_sizes must have one entry per column.")
+        ranked = sorted(
+            all_pairs,
+            key=lambda ij: (
+                float(domain_sizes[ij[0]]) * float(domain_sizes[ij[1]]),
+                ij[0],
+                ij[1],
+            ),
+        )
+        return ranked[:M]
+    if selection == "random":
+        if len(all_pairs) <= M:
+            return list(all_pairs)
+        rng = np.random.RandomState(rng_seed)
+        chosen_idx = rng.choice(len(all_pairs), size=M, replace=False)
+        chosen = [all_pairs[int(i)] for i in chosen_idx]
+        chosen.sort()
+        return chosen
+    raise ValueError(
+        f"Unknown selection '{selection}'. Choose from: domain_size, random."
+    )
+
+
+def compute_2way_marginals_shared(X, col_pairs, shared_edges):
+    """Joint histograms on the same shared edges as the one-way marginals."""
+    marginals_2way = []
+    if not col_pairs:
+        return marginals_2way
+    for (ci, cj) in col_pairs:
+        ex = shared_edges[ci]
+        ey = shared_edges[cj]
+        hist, _, _ = np.histogram2d(X[:, ci], X[:, cj], bins=[ex, ey])
+        hist = hist.astype(np.float64)
+        total = hist.sum()
+        if total > 0:
+            hist = hist / total
+        marginals_2way.append({
+            "hist": hist,
+            "edges_x": np.asarray(ex).copy(),
+            "edges_y": np.asarray(ey).copy(),
+            "cols": (int(ci), int(cj)),
+        })
+    return marginals_2way
+
+
+def compute_1way_counts_shared(X, shared_edges):
+    """Compute unnormalised one-way counts on public shared bin edges."""
+    counts = []
+    for col_idx, edges in enumerate(shared_edges):
+        hist, _ = np.histogram(X[:, col_idx], bins=edges)
+        counts.append({
+            "hist": hist.astype(np.float64),
+            "edges": np.asarray(edges).copy(),
+            "col": int(col_idx),
+        })
+    return counts
+
+
+def compute_2way_counts_shared(X, col_pairs, shared_edges):
+    """Compute unnormalised two-way counts on public shared bin edges."""
+    counts = []
+    for ci, cj in col_pairs:
+        ex = shared_edges[ci]
+        ey = shared_edges[cj]
+        hist, _, _ = np.histogram2d(X[:, ci], X[:, cj], bins=[ex, ey])
+        counts.append({
+            "hist": hist.astype(np.float64),
+            "edges_x": np.asarray(ex).copy(),
+            "edges_y": np.asarray(ey).copy(),
+            "cols": (int(ci), int(cj)),
+        })
+    return counts
+
+
+def maybe_round_count_hists(marginals, round_counts=False):
+    """Round noisy histogram vectors to integers before aggregation.
+
+    The Gaussian draw is continuous. Rounding is deterministic
+    post-processing so a later modular sum can cancel the masks.
+    ``round_counts=False`` returns the float histograms unchanged.
+    ``CrossSynthGenerator.fit`` turns rounding on by default.
+    """
+    if not round_counts:
+        return marginals
+    rounded = []
+    for m in marginals:
+        item = dict(m)
+        item["hist"] = np.rint(np.asarray(m["hist"], dtype=np.float64))
+        rounded.append(item)
+    return rounded
+
+
+def add_dp_noise_count_queries(marginals_1way, marginals_2way, epsilon,
+                               delta=1e-5, replace_one=True, rng=None):
+    """Release one concatenated noisy count workload.
+
+    Every record contributes to one bin in each query. Under replace-one
+    adjacency, changing a record changes at most two bins per query, so the
+    L2 sensitivity of the concatenated workload is ``sqrt(2 * |Q|)``. Under
+    add/remove adjacency it is ``sqrt(|Q|)``. One Gaussian draw is calibrated
+    to the complete workload; the privacy budget is not spent once per query.
+
+    The returned histograms remain in count space. Clipping, normalisation,
+    integer rounding, and secure summation are downstream post-processing.
+    """
+    marginals_2way = list(marginals_2way or [])
+    query_count = len(marginals_1way) + len(marginals_2way)
+    if query_count <= 0:
+        raise ValueError("At least one marginal query is required.")
+    sensitivity = np.sqrt((2.0 if replace_one else 1.0) * query_count)
+    sigma = _calibrate_gaussian_noise(sensitivity, epsilon, delta)
+    if rng is None:
+        rng = np.random
+
+    def _noisy_copy(items):
+        released = []
+        for item in items:
+            copied = dict(item)
+            hist = np.asarray(item["hist"], dtype=np.float64)
+            copied["hist"] = hist + rng.normal(0.0, sigma, size=hist.shape)
+            released.append(copied)
+        return released
+
+    return (
+        _noisy_copy(marginals_1way),
+        _noisy_copy(marginals_2way),
+        float(sigma),
+        float(sensitivity),
+    )
+
+
+def scale_like_encoded_marginal(raw, encoded):
+    """Map a control vector with the encoded marginal's mean and std.
+
+    ``encode_marginals`` standardizes the histogram vector. Applying that
+    vector's own mean and std puts a same-length control on the encoder
+    output scale. A constant is not standardized with its own variance:
+    that variance is zero and the map would be the zero vector.
+    """
+    raw = np.asarray(raw, dtype=np.float32)
+    ref = np.asarray(encoded, dtype=np.float32)
+    mean_val = ref.mean()
+    std_val = ref.std()
+    if std_val > 1e-8:
+        return ((raw - mean_val) / std_val).astype(np.float32)
+    return (raw - mean_val).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Gaussian mechanism for DP
 # ---------------------------------------------------------------------------
@@ -197,6 +370,8 @@ def add_dp_noise_1way(marginals, n_samples, epsilon, delta=1e-5):
     noisy_marginals : list of dict
         Same structure with noise added to 'hist'.
     """
+    # Legacy normalized-histogram path. Sensitivity stays 1/n_samples.
+    # The manuscript count workload uses add_dp_noise_count_queries.
     sensitivity = 1.0 / max(n_samples, 1)
     sigma = _calibrate_gaussian_noise(sensitivity, epsilon, delta)
 
@@ -236,6 +411,8 @@ def add_dp_noise_2way(marginals_2way, n_samples, epsilon, delta=1e-5):
     -------
     noisy_marginals : list of dict
     """
+    # Legacy normalized-histogram path, same 1/n_samples scale as
+    # add_dp_noise_1way. The count workload does not use this function.
     sensitivity = 1.0 / max(n_samples, 1)
     sigma = _calibrate_gaussian_noise(sensitivity, epsilon, delta)
 
@@ -337,6 +514,114 @@ def aggregate_marginals_2way(all_party_marginals_2way):
     return aggregated
 
 
+def secure_sum_integer_vectors(vectors, modulus=2_147_483_647,
+                               rng_seed=42):
+    """Simulate serverless additive secret sharing over ``Z_modulus``.
+
+    Each sender makes one share for every receiver. Receivers broadcast their
+    partial sums, and the partial sums reconstruct only the aggregate. The
+    function returns the centered signed representative of that aggregate.
+    It is a protocol simulator, not a cryptographic transport implementation.
+    """
+    if len(vectors) < 2:
+        raise ValueError("Secure summation requires at least two parties.")
+    if modulus <= 2:
+        raise ValueError("modulus must be greater than 2.")
+    arrays = [np.asarray(v, dtype=np.int64).reshape(-1) for v in vectors]
+    length = arrays[0].size
+    if any(v.size != length for v in arrays):
+        raise ValueError("All secure-sum vectors must have the same length.")
+
+    plain = np.sum(np.stack(arrays, axis=0), axis=0, dtype=np.int64)
+    if np.any(np.abs(plain) >= modulus // 2):
+        raise ValueError("modulus is too small for centered reconstruction.")
+
+    rng = np.random.RandomState(rng_seed)
+    receiver_partials = [np.zeros(length, dtype=np.int64)
+                         for _ in arrays]
+    for sender_idx, vector in enumerate(arrays):
+        random_shares = []
+        for _ in range(len(arrays) - 1):
+            random_shares.append(
+                rng.randint(0, modulus, size=length, dtype=np.int64)
+            )
+        residual = np.mod(
+            np.mod(vector, modulus)
+            - sum(random_shares, np.zeros(length, dtype=np.int64)),
+            modulus,
+        )
+        shares = random_shares + [residual]
+        # Rotate the residual receiver so one participant does not always get
+        # every residual share. This does not change reconstruction.
+        shares = shares[-sender_idx:] + shares[:-sender_idx] if sender_idx else shares
+        for receiver_idx, share in enumerate(shares):
+            receiver_partials[receiver_idx] = np.mod(
+                receiver_partials[receiver_idx] + share, modulus
+            )
+
+    reconstructed = np.zeros(length, dtype=np.int64)
+    for partial in receiver_partials:
+        reconstructed = np.mod(reconstructed + partial, modulus)
+    signed = reconstructed.copy()
+    signed[signed > modulus // 2] -= modulus
+    if not np.array_equal(signed, plain):
+        raise AssertionError("Additive-share reconstruction failed.")
+    return signed
+
+
+def aggregate_count_queries(all_party_1way, all_party_2way=None,
+                            secure=False, modulus=2_147_483_647,
+                            rng_seed=42):
+    """Sum noisy count queries and convert each query to a probability table.
+
+    Negative noisy cells are clipped only after cross-party aggregation. When
+    ``secure`` is true, inputs must already have integer-valued histograms and
+    the sum is reconstructed with :func:`secure_sum_integer_vectors`.
+    """
+    if not all_party_1way:
+        raise ValueError("At least one party is required.")
+    all_party_2way = all_party_2way or [[] for _ in all_party_1way]
+
+    def _aggregate_query_group(groups, key_kind):
+        if not groups or not groups[0]:
+            return []
+        n_queries = len(groups[0])
+        if any(len(group) != n_queries for group in groups):
+            raise ValueError("Every party must release the same query set.")
+        result = []
+        for query_idx in range(n_queries):
+            vectors = [group[query_idx]["hist"].reshape(-1) for group in groups]
+            if secure:
+                if any(not np.allclose(v, np.rint(v)) for v in vectors):
+                    raise ValueError(
+                        "Secure modular summation requires rounded integer counts."
+                    )
+                summed = secure_sum_integer_vectors(
+                    [np.rint(v).astype(np.int64) for v in vectors],
+                    modulus=modulus,
+                    rng_seed=rng_seed + query_idx,
+                ).astype(np.float64)
+            else:
+                summed = np.sum(np.stack(vectors, axis=0), axis=0)
+            shape = groups[0][query_idx]["hist"].shape
+            summed = np.maximum(summed.reshape(shape), 0.0)
+            total = float(summed.sum())
+            if total > 0:
+                probability = summed / total
+            else:
+                probability = np.full(shape, 1.0 / summed.size)
+            copied = dict(groups[0][query_idx])
+            copied["hist"] = probability
+            copied["query_kind"] = key_kind
+            result.append(copied)
+        return result
+
+    return (
+        _aggregate_query_group(all_party_1way, "one_way"),
+        _aggregate_query_group(all_party_2way, "two_way"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Marginal encoding (for conditioning the diffusion model)
 # ---------------------------------------------------------------------------
@@ -397,7 +682,7 @@ def encode_marginals(marginals_1way, marginals_2way=None, max_dim=256):
     return vec
 
 
-def compute_shared_bin_edges(parties, n_bins=20):
+def compute_shared_bin_edges(parties, n_bins=20, categorical_indices=None):
     """
     Compute shared bin edges across all parties for consistent marginals.
 
@@ -407,23 +692,34 @@ def compute_shared_bin_edges(parties, n_bins=20):
         Each party dict has 'X' (np.ndarray).
     n_bins : int
         Number of bins per column.
+    categorical_indices : iterable[int] or None
+        Integer-coded categorical columns. These receive one unit-width bin
+        per observed category rather than ``n_bins`` numerical bins.
 
     Returns
     -------
     all_edges : list of np.ndarray
         all_edges[col] has shape (n_bins+1,).
     """
-    # Pool min/max across parties
+    # Pool min/max across parties. The runner supplies integer-coded columns
+    # from the dataset schema, including the jointly synthesized binary label.
     d = parties[0]["X"].shape[1]
     all_edges = []
+    categorical_indices = set(categorical_indices or [])
 
     for col_idx in range(d):
         col_min = min(p["X"][:, col_idx].min() for p in parties)
         col_max = max(p["X"][:, col_idx].max() for p in parties)
-        if col_min == col_max:
+        if col_idx in categorical_indices:
+            low = int(np.floor(col_min))
+            high = int(np.ceil(col_max))
+            edges = np.arange(low - 0.5, high + 1.5, 1.0)
+        elif col_min == col_max:
             col_min -= 0.5
             col_max += 0.5
-        edges = np.linspace(col_min - 1e-6, col_max + 1e-6, n_bins + 1)
+            edges = np.linspace(col_min, col_max, n_bins + 1)
+        else:
+            edges = np.linspace(col_min - 1e-6, col_max + 1e-6, n_bins + 1)
         all_edges.append(edges)
 
     return all_edges

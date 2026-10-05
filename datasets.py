@@ -16,6 +16,7 @@ Designed to run on CPU (32 GB RAM). All datasets auto-download.
 """
 
 import warnings
+import os
 import numpy as np
 import pandas as pd
 from sklearn.datasets import fetch_openml
@@ -23,6 +24,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+_OPENML_DATA_HOME = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "openml"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +58,10 @@ def load_adult():
     Adult Census Income dataset - predict whether income >50K.
     ~32K rows, 14 features (mix of categorical and numerical).
     """
-    data = fetch_openml("adult", version=2, as_frame=True, parser="auto")
+    data = fetch_openml(
+        "adult", version=2, as_frame=True, parser="auto",
+        data_home=_OPENML_DATA_HOME,
+    )
     df = data.data.copy()
     target = data.target.copy()
 
@@ -75,7 +83,10 @@ def load_credit():
     German Credit dataset - predict credit risk (good/bad).
     1000 rows, 20 features.
     """
-    data = fetch_openml("credit-g", version=1, as_frame=True, parser="auto")
+    data = fetch_openml(
+        "credit-g", version=1, as_frame=True, parser="auto",
+        data_home=_OPENML_DATA_HOME,
+    )
     df = data.data.copy()
     target = data.target.copy()
 
@@ -95,7 +106,10 @@ def load_bank():
     Bank Marketing dataset - predict term deposit subscription.
     ~45K rows, 16 features.
     """
-    data = fetch_openml("bank-marketing", version=1, as_frame=True, parser="auto")
+    data = fetch_openml(
+        "bank-marketing", version=1, as_frame=True, parser="auto",
+        data_home=_OPENML_DATA_HOME,
+    )
     df = data.data.copy()
     target = data.target.copy()
 
@@ -194,7 +208,7 @@ _PARTITION_COLUMNS = {
 # ---------------------------------------------------------------------------
 
 def partition_data(X, y, K, mode="random", random_state=42,
-                   partition_col_idx=0):
+                   partition_col_idx=0, partition_edges=None):
     """
     Split data into K disjoint parties.
 
@@ -211,6 +225,8 @@ def partition_data(X, y, K, mode="random", random_state=42,
         'correlated' - party k gets samples from the k-th quantile range
                        of the column at partition_col_idx, creating
                        heterogeneous parties with different distributions.
+        'support_mismatch' - hard, non-overlapping ranges supplied through
+                       partition_edges. Requires len(partition_edges) = K-1.
     random_state : int
         Seed for reproducibility.
     partition_col_idx : int
@@ -264,6 +280,22 @@ def partition_data(X, y, K, mode="random", random_state=42,
         remaining = np.where(~assigned)[0]
         if len(remaining) > 0:
             splits[-1] = np.concatenate([splits[-1], remaining])
+
+    elif mode == "support_mismatch":
+        if partition_edges is None or len(partition_edges) != K - 1:
+            raise ValueError(
+                "support_mismatch requires K-1 ordered partition_edges."
+            )
+        edges = np.asarray(partition_edges, dtype=np.float64)
+        if np.any(np.diff(edges) <= 0):
+            raise ValueError("partition_edges must be strictly increasing.")
+        col_values = X[:, partition_col_idx]
+        bucket = np.digitize(col_values, edges, right=False)
+        splits = [np.where(bucket == k)[0] for k in range(K)]
+        if any(len(idx) == 0 for idx in splits):
+            raise ValueError(
+                "A support-mismatch range is empty after preprocessing."
+            )
 
     else:
         raise ValueError(f"Unknown partition mode: '{mode}'")

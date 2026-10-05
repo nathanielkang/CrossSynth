@@ -55,6 +55,7 @@ from metrics import (
     marginal_distance_1way,
     marginal_distance_2way,
     correlation_error,
+    conditional_ml_f1,
 )
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -115,7 +116,20 @@ def generate_synthetic_labels(X_synthetic, X_real, y_real, cat_indices=None):
 # ---------------------------------------------------------------------------
 
 def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
-                          partition_mode="random", epochs=50, verbose=True):
+                          partition_mode="random", epochs=50, verbose=True,
+                          cond_mode="marginal", M=50,
+                          selection="domain_size",
+                          eps_marginal_frac=0.5, round_counts=False,
+                          marginal_mode="legacy_probability",
+                          secure_aggregation=False,
+                          private_training=False, max_grad_norm=1.0,
+                          delta_marginal_frac=0.5,
+                          normalization="global", joint_target=False,
+                          calibrate_output=False,
+                          calibration_oversample=2.0,
+                          calibration_passes=5,
+                          calibration_include_2way=True,
+                          calibration_damping=0.5):
     """
     Run a single experiment configuration.
 
@@ -156,9 +170,21 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
     partition_col_idx = ds.get("partition_col_idx", 0)
 
     # Partition into K parties
+    partition_edges = None
+    if partition_mode == "support_mismatch":
+        if dataset_name != "adult" or K != 3:
+            raise ValueError(
+                "The preregistered support-mismatch test is Adult with K=3."
+            )
+        numeric_position = ds["num_indices"].index(partition_col_idx)
+        mean = float(ds["scaler"].mean_[numeric_position])
+        scale = float(ds["scaler"].scale_[numeric_position])
+        partition_edges = [(30.0 - mean) / scale, (50.0 - mean) / scale]
+
     parties = partition_data(
         X_train, y_train, K=K, mode=partition_mode,
-        random_state=seed, partition_col_idx=partition_col_idx
+        random_state=seed, partition_col_idx=partition_col_idx,
+        partition_edges=partition_edges,
     )
     if verbose:
         print(f"  Partitioned into {K} parties (mode={partition_mode}):")
@@ -167,7 +193,10 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
 
     # Create generator
     gen_kwargs = {}
-    if method_name in ["fedsynth", "independent", "centralized"]:
+    diffusion_methods = [
+        "fedsynth", "fedavg", "fedavg_8bit", "independent", "centralized"
+    ]
+    if method_name in diffusion_methods:
         gen_kwargs = {
             "hidden_dim": 256,
             "n_layers": 3,
@@ -177,6 +206,16 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
             gen_kwargs["cond_dim"] = 256
     elif method_name == "privbayes":
         gen_kwargs = {"n_bins": 15, "max_parents": 2}
+
+    if joint_target:
+        parties_for_generator = []
+        for party in parties:
+            parties_for_generator.append({
+                "X": np.column_stack([party["X"], party["y"]]).astype(np.float32),
+                "y": party["y"],
+            })
+    else:
+        parties_for_generator = parties
 
     generator = get_generator(method_name, **gen_kwargs)
 
@@ -188,27 +227,63 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
     # Train
     t_start = time.time()
     fit_kwargs = {"epsilon": epsilon}
-    if method_name in ["fedsynth", "independent", "centralized"]:
+    if method_name in diffusion_methods:
         fit_kwargs["epochs"] = epochs
-        fit_kwargs["batch_size"] = min(256, max(p["X"].shape[0] for p in parties))
+        batch_cap = 64 if private_training else 256
+        fit_kwargs["batch_size"] = min(
+            batch_cap, max(p["X"].shape[0] for p in parties_for_generator)
+        )
         fit_kwargs["lr"] = 1e-3
         fit_kwargs["verbose"] = verbose
+        if method_name == "fedsynth":
+            fit_kwargs.update({
+                "cond_mode": cond_mode,
+                "M": M,
+                "selection": selection,
+                "eps_marginal_frac": eps_marginal_frac,
+                "round_counts": round_counts,
+                "marginal_mode": marginal_mode,
+                "secure_aggregation": secure_aggregation,
+                "private_training": private_training,
+                "delta_marginal_frac": delta_marginal_frac,
+                "max_grad_norm": max_grad_norm,
+                "normalization": normalization,
+                "calibrate_output": calibrate_output,
+                "calibration_oversample": calibration_oversample,
+                "calibration_passes": calibration_passes,
+                "calibration_include_2way": calibration_include_2way,
+                "calibration_damping": calibration_damping,
+                "categorical_indices": (
+                    list(ds.get("cat_indices", []))
+                    + ([X_train.shape[1]] if joint_target else [])
+                ),
+            })
+        elif method_name == "independent":
+            fit_kwargs.update({
+                "private_training": private_training,
+                "max_grad_norm": max_grad_norm,
+                "normalization": normalization,
+            })
     elif method_name == "ctgan":
         fit_kwargs["epochs"] = min(epochs, 150)
 
-    generator.fit(parties, **fit_kwargs)
+    generator.fit(parties_for_generator, **fit_kwargs)
     t_train = time.time() - t_start
 
     # Generate synthetic data
     n_samples = X_train.shape[0]
     t_start = time.time()
-    X_synthetic = generator.generate(n_samples)
+    generated = generator.generate(n_samples)
     t_gen = time.time() - t_start
 
-    # Generate synthetic labels (by nearest-neighbor matching to real data)
-    y_synthetic = generate_synthetic_labels(
-        X_synthetic, X_train, y_train, ds.get("cat_indices")
-    )
+    if joint_target:
+        X_synthetic = generated[:, :-1]
+        y_synthetic = (generated[:, -1] >= 0.5).astype(np.float32)
+    else:
+        X_synthetic = generated
+        y_synthetic = generate_synthetic_labels(
+            X_synthetic, X_train, y_train, ds.get("cat_indices")
+        )
 
     # --- Evaluate ---
 
@@ -224,6 +299,16 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
 
     # Correlation error
     corr_err = correlation_error(X_synthetic, X_train)
+
+    conditional_score = float("nan")
+    if partition_mode == "support_mismatch":
+        test_group = np.digitize(
+            X_test[:, partition_col_idx], partition_edges, right=False
+        )
+        conditional_score = conditional_ml_f1(
+            X_synthetic, y_synthetic, X_test, y_test, test_group,
+            model_name="xgboost", random_state=seed,
+        )
 
     # Extract primary metrics
     catboost_f1 = ml_res.get("catboost", {}).get("f1", float("nan"))
@@ -245,13 +330,50 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
         "tv_1way": tv_1way,
         "tv_2way": tv_2way,
         "corr_error": corr_err,
+        "conditional_f1": conditional_score,
         "n_train": n_samples,
         "n_synthetic": X_synthetic.shape[0],
+        "real_positive_rate": float(np.mean(y_train)),
+        "synthetic_positive_rate": float(np.mean(y_synthetic)),
+        "synthetic_label_count": int(np.unique(y_synthetic).size),
         "time_train": t_train,
         "time_generate": t_gen,
         "privacy_epsilon": epsilon,
         "privacy_delta": 1e-5,
+        "cond_mode": cond_mode if method_name == "fedsynth" else None,
+        "marginal_set_size": M if method_name == "fedsynth" else None,
+        "marginal_selection": selection if method_name == "fedsynth" else None,
+        "eps_marginal_frac": (
+            eps_marginal_frac if method_name == "fedsynth" else None
+        ),
+        "marginal_mode": marginal_mode if method_name == "fedsynth" else None,
+        "round_counts": round_counts if method_name == "fedsynth" else None,
+        "secure_aggregation": (
+            secure_aggregation if method_name == "fedsynth" else None
+        ),
+        "private_training": (
+            private_training if method_name == "fedsynth" else None
+        ),
+        "normalization": normalization if method_name == "fedsynth" else None,
+        "joint_target": bool(joint_target),
+        "calibrate_output": (
+            calibrate_output if method_name == "fedsynth" else None
+        ),
     }
+    if method_name == "fedsynth":
+        for key, value in generator.release_metadata.items():
+            if key == "selected_pairs":
+                result["selected_pair_count"] = len(value)
+            elif key == "achieved_training_epsilons":
+                achieved = [v for v in value if v is not None]
+                result["achieved_training_epsilon_max"] = (
+                    max(achieved) if achieved else None
+                )
+            else:
+                result[f"release_{key}"] = value
+    if method_name in ("fedavg", "fedavg_8bit"):
+        for key, value in generator.communication_metadata.items():
+            result[f"communication_{key}"] = value
 
     if verbose:
         print(f"\n  Results for {tag}:")
@@ -259,6 +381,10 @@ def run_single_experiment(dataset_name, method_name, K, epsilon, seed,
         print(f"    XGBoost  F1={xgboost_f1:.4f}  Acc={xgboost_acc:.4f}")
         print(f"    TV 1-way={tv_1way:.4f}  TV 2-way={tv_2way:.4f}")
         print(f"    Corr Error={corr_err:.4f}")
+        print(f"    Positive rate real={np.mean(y_train):.4f}  "
+              f"synthetic={np.mean(y_synthetic):.4f}")
+        if not np.isnan(conditional_score):
+            print(f"    Conditional F1={conditional_score:.4f}")
         print(f"    Train time={t_train:.1f}s  Gen time={t_gen:.1f}s")
 
     return result
@@ -415,8 +541,53 @@ def main():
     )
     parser.add_argument(
         "--partition", type=str, nargs="+", default=None,
-        help="Partition modes: random, correlated. Default: both."
+        help=("Partition modes: random, correlated, support_mismatch. "
+              "Default: random and correlated.")
     )
+    parser.add_argument(
+        "--profile", choices=["legacy", "paper"], default="paper",
+        help=("paper is the manuscript protocol: count-space release, "
+              "one tenth of epsilon and of delta on the count release, "
+              "rounding, in-process secure aggregation, private training, "
+              "and regularized one-way output calibration. "
+              "legacy is the explicit switch to probability-space noise.")
+    )
+    parser.add_argument(
+        "--cond-mode", choices=["marginal", "constant", "random", "none"],
+        default="marginal",
+    )
+    parser.add_argument("--marginal-set-size", type=int, default=50)
+    parser.add_argument(
+        "--marginal-selection", choices=["domain_size", "random"],
+        default="domain_size",
+    )
+    parser.add_argument("--eps-marginal-frac", type=float, default=None)
+    parser.add_argument(
+        "--round-counts", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--secure-aggregation", action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--private-training", action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--joint-target", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--calibrate-output", action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--calibration-oversample", type=float, default=2.0)
+    parser.add_argument("--calibration-passes", type=int, default=None)
+    parser.add_argument(
+        "--calibration-include-2way", action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--calibration-damping", type=float, default=None)
     parser.add_argument(
         "--seeds", type=int, default=2,
         help="Number of random seeds (default: 2)."
@@ -439,6 +610,46 @@ def main():
     )
 
     args = parser.parse_args()
+
+    paper_profile = args.profile == "paper"
+    marginal_mode = "count" if paper_profile else "legacy_probability"
+    normalization = "local" if paper_profile else "global"
+    eps_marginal_frac = (
+        args.eps_marginal_frac
+        if args.eps_marginal_frac is not None
+        else (0.1 if paper_profile else 0.5)
+    )
+    delta_marginal_frac = 0.1 if paper_profile else 0.5
+    round_counts = (
+        args.round_counts if args.round_counts is not None else paper_profile
+    )
+    secure_aggregation = (
+        args.secure_aggregation
+        if args.secure_aggregation is not None else paper_profile
+    )
+    private_training = (
+        args.private_training
+        if args.private_training is not None else paper_profile
+    )
+    joint_target = (
+        args.joint_target if args.joint_target is not None else paper_profile
+    )
+    calibrate_output = (
+        args.calibrate_output
+        if args.calibrate_output is not None else paper_profile
+    )
+    calibration_passes = (
+        args.calibration_passes
+        if args.calibration_passes is not None else (1 if paper_profile else 5)
+    )
+    calibration_include_2way = (
+        args.calibration_include_2way
+        if args.calibration_include_2way is not None else (not paper_profile)
+    )
+    calibration_damping = (
+        args.calibration_damping
+        if args.calibration_damping is not None else (0.1 if paper_profile else 0.5)
+    )
 
     # Resolve output directory relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -477,6 +688,20 @@ def main():
     print(f"  Epsilons   : {epsilons}")
     print(f"  Seeds      : {seeds}")
     print(f"  Epochs     : {epochs}")
+    print(f"  Profile    : {args.profile}")
+    print(f"  Conditioning: {args.cond_mode}")
+    print(f"  Marginals  : M={args.marginal_set_size}, "
+          f"selection={args.marginal_selection}, mode={marginal_mode}")
+    print(f"  Budget     : marginal epsilon fraction={eps_marginal_frac}, "
+          f"marginal delta fraction={delta_marginal_frac}")
+    print(f"  Integer secure sum: round={round_counts}, "
+          f"secure={secure_aggregation}")
+    print(f"  Private training={private_training}, joint target={joint_target}")
+    print(f"  Output calibration={calibrate_output}, "
+          f"oversample={args.calibration_oversample}, "
+          f"passes={calibration_passes}, "
+          f"two_way={calibration_include_2way}, "
+          f"damping={calibration_damping}")
     print(f"  Total experiments: {total}")
     print(f"  Output dir: {output_dir}")
     print()
@@ -511,6 +736,23 @@ def main():
                                     partition_mode=partition_mode,
                                     epochs=epochs,
                                     verbose=args.verbose,
+                                    cond_mode=args.cond_mode,
+                                    M=args.marginal_set_size,
+                                    selection=args.marginal_selection,
+                                    eps_marginal_frac=eps_marginal_frac,
+                                    delta_marginal_frac=delta_marginal_frac,
+                                    round_counts=round_counts,
+                                    marginal_mode=marginal_mode,
+                                    secure_aggregation=secure_aggregation,
+                                    private_training=private_training,
+                                    max_grad_norm=args.max_grad_norm,
+                                    normalization=normalization,
+                                    joint_target=joint_target,
+                                    calibrate_output=calibrate_output,
+                                    calibration_oversample=args.calibration_oversample,
+                                    calibration_passes=calibration_passes,
+                                    calibration_include_2way=calibration_include_2way,
+                                    calibration_damping=calibration_damping,
                                 )
 
                                 if result is not None:
@@ -624,6 +866,22 @@ def main():
         "epsilons": epsilons,
         "seeds": seeds,
         "epochs": epochs,
+        "profile": args.profile,
+        "cond_mode": args.cond_mode,
+        "marginal_set_size": args.marginal_set_size,
+        "marginal_selection": args.marginal_selection,
+        "eps_marginal_frac": eps_marginal_frac,
+        "round_counts": round_counts,
+        "secure_aggregation": secure_aggregation,
+        "private_training": private_training,
+        "max_grad_norm": args.max_grad_norm,
+        "normalization": normalization,
+        "joint_target": joint_target,
+        "calibrate_output": calibrate_output,
+        "calibration_oversample": args.calibration_oversample,
+        "calibration_passes": calibration_passes,
+        "calibration_include_2way": calibration_include_2way,
+        "calibration_damping": calibration_damping,
         "total_experiments": total,
         "completed": completed,
         "failed": failed,
@@ -640,6 +898,8 @@ def main():
     print(f"  Total: {total} | Succeeded: {total - failed - skipped} | "
           f"Failed: {failed} | Skipped: {skipped}")
     print(f"{'='*80}")
+    if df_valid.empty:
+        raise SystemExit("All experiment configurations failed or were skipped.")
 
 
 if __name__ == "__main__":

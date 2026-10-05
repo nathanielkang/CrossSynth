@@ -8,6 +8,8 @@ Metrics:
                           marginals between synthetic and real.
     3. Cross-Party Correlation - Mean absolute error of pairwise Pearson
                           correlations between synthetic union and real union.
+    4. conditional_f1  - Unweighted mean of positive-class F1 within groups.
+                          Not called by the experiment runner.
 
 All functions work on numpy arrays.
 """
@@ -331,6 +333,64 @@ def correlation_error(X_synthetic, X_real):
 
     mae = float(np.mean(np.abs(real_vals - syn_vals)))
     return mae
+
+
+def conditional_f1(y_true, y_pred, group):
+    """Unweighted mean of positive-class F1 inside each group.
+
+    Positive class is 1. Each distinct value of ``group`` contributes one
+    F1, and those scores are averaged with equal weight. The experiment
+    runner does not call this function.
+    """
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    group = np.asarray(group).reshape(-1)
+    if not (y_true.shape[0] == y_pred.shape[0] == group.shape[0]):
+        raise ValueError("y_true, y_pred, and group must have the same length.")
+    if y_true.shape[0] == 0:
+        return 0.0
+    scores = []
+    for g in np.unique(group):
+        mask = group == g
+        scores.append(float(
+            f1_score(y_true[mask], y_pred[mask], pos_label=1, zero_division=0)
+        ))
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
+
+def conditional_ml_f1(X_synthetic, y_synthetic, X_test, y_test, group,
+                      model_name="xgboost", random_state=42):
+    """Train on synthetic data and average positive-class F1 across groups."""
+    y_synthetic = np.asarray(y_synthetic).reshape(-1).astype(int)
+    y_test = np.asarray(y_test).reshape(-1).astype(int)
+    if model_name == "xgboost":
+        from xgboost import XGBClassifier
+        model = XGBClassifier(
+            n_estimators=200,
+            learning_rate=0.1,
+            max_depth=6,
+            verbosity=0,
+            random_state=random_state,
+            n_jobs=4,
+            eval_metric="logloss",
+        )
+    elif model_name == "catboost":
+        from catboost import CatBoostClassifier
+        model = CatBoostClassifier(
+            iterations=200,
+            learning_rate=0.1,
+            depth=6,
+            verbose=0,
+            random_seed=random_state,
+            thread_count=4,
+        )
+    else:
+        raise ValueError("model_name must be 'xgboost' or 'catboost'.")
+    model.fit(X_synthetic, y_synthetic)
+    prediction = np.asarray(model.predict(X_test)).reshape(-1).astype(int)
+    return conditional_f1(y_test, prediction, group)
 
 
 # ---------------------------------------------------------------------------

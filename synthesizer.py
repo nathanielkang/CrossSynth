@@ -17,6 +17,7 @@ Designed to run on CPU (32 GB RAM).
 """
 
 import math
+import copy
 import warnings
 import numpy as np
 import pandas as pd
@@ -27,10 +28,20 @@ from tqdm import tqdm
 
 from marginals import (
     compute_1way_marginals_shared,
-    compute_2way_marginals,
+    compute_2way_marginals_shared,
+    compute_1way_counts_shared,
+    compute_2way_counts_shared,
     compute_shared_bin_edges,
+    column_domain_sizes,
+    select_2way_pairs,
     add_dp_noise_1way,
+    add_dp_noise_2way,
     aggregate_marginals_1way,
+    aggregate_marginals_2way,
+    add_dp_noise_count_queries,
+    aggregate_count_queries,
+    maybe_round_count_hists,
+    scale_like_encoded_marginal,
     encode_marginals,
 )
 
@@ -137,6 +148,57 @@ class ConditionedDenoisingMLP(nn.Module):
         return self.net(inp)
 
 
+def _bind_opacus_sample_rate(loader, sample_rate):
+    """Make ``len(loader)`` the integer Opacus inverts to ``sample_rate``.
+
+    Opacus 1.6 sets ``sample_rate = 1/len(data_loader)`` inside
+    ``make_private_with_epsilon`` and also forwards unknown keywords into
+    ``get_noise_multiplier``, which already binds ``sample_rate``. A second
+    keyword raises ``TypeError``. ``len`` is looked up on the class, so the
+    reported length has to live there. Rates above one are not Poisson
+    probabilities; they are capped at one.
+    """
+    rate = float(sample_rate)
+    if rate <= 0.0:
+        raise ValueError("sample_rate q_k=B/n_k must be positive.")
+    if rate > 1.0:
+        rate = 1.0
+    reported = max(1, int(round(1.0 / rate)))
+
+    class _QLenLoader(loader.__class__):
+        def __len__(self):
+            return reported
+
+    loader.__class__ = _QLenLoader
+    return loader
+
+
+def _opacus_privacy_engine():
+    """Return an Opacus engine that accepts ``sample_rate=q_k``.
+
+    The import stays inside this function so a missing Opacus install does
+    not block count release. The engine is Opacus; the subclass only places
+    ``q_k`` where ``make_private_with_epsilon`` will read it.
+    """
+    try:
+        from opacus import PrivacyEngine
+    except ImportError as exc:
+        raise ImportError(
+            "Private diffusion training requires opacus. "
+            "Install the dependencies from requirements.txt."
+        ) from exc
+
+    class _SampleRatePrivacyEngine(PrivacyEngine):
+        def make_private_with_epsilon(self, *args, sample_rate=None, **kwargs):
+            if sample_rate is not None:
+                kwargs["data_loader"] = _bind_opacus_sample_rate(
+                    kwargs["data_loader"], sample_rate
+                )
+            return super().make_private_with_epsilon(*args, **kwargs)
+
+    return _SampleRatePrivacyEngine()
+
+
 class TabularDiffusion(nn.Module):
     """
     Tabular diffusion model (simplified TabDDPM) with optional conditioning.
@@ -201,16 +263,24 @@ class TabularDiffusion(nn.Module):
         loss = (noise - predicted).pow(2).mean()
         return loss
 
+    def forward(self, x_0, cond=None):
+        """Return the scalar denoising loss for ordinary or private training."""
+        return self.compute_loss(x_0, cond)
+
     def train_model(self, X_train, cond_vec=None, epochs=50,
-                    batch_size=256, lr=1e-3, verbose=True):
+                    batch_size=256, lr=1e-3, verbose=True,
+                    dp_epsilon=None, dp_delta=1e-5,
+                    max_grad_norm=1.0):
         """
         Train the diffusion model.
 
         Parameters
         ----------
         X_train : np.ndarray, shape (n, d)
-        cond_vec : np.ndarray, shape (cond_dim,) or None
-            If provided, this conditioning vector is broadcast to all samples.
+        cond_vec : np.ndarray, shape (cond_dim,) or (n, cond_dim) or None
+            A one-dimensional vector is broadcast to every row. That is the
+            CrossSynth protocol input. A matrix remains accepted when a
+            caller has already built one condition per row.
         epochs : int
         batch_size : int
         lr : float
@@ -223,11 +293,18 @@ class TabularDiffusion(nn.Module):
         self.train()
         X_tensor = torch.tensor(X_train, dtype=torch.float32)
 
-        # Prepare conditioning: broadcast to all samples
+        # One vector is broadcast. A matrix is a per-row condition.
         cond_tensor = None
         if cond_vec is not None and self.cond_dim > 0:
             cond_tensor = torch.tensor(cond_vec, dtype=torch.float32)
-            cond_tensor = cond_tensor.unsqueeze(0).expand(X_tensor.shape[0], -1)
+            if cond_tensor.ndim == 1:
+                cond_tensor = cond_tensor.unsqueeze(0).expand(
+                    X_tensor.shape[0], -1
+                )
+            elif cond_tensor.ndim != 2 or cond_tensor.shape[0] != X_tensor.shape[0]:
+                raise ValueError(
+                    "cond_vec must have shape (cond_dim,) or (n, cond_dim)."
+                )
 
         if cond_tensor is not None:
             dataset = TensorDataset(X_tensor, cond_tensor)
@@ -237,6 +314,24 @@ class TabularDiffusion(nn.Module):
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                             drop_last=False)
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        training_model = self
+        privacy_engine = None
+        if dp_epsilon is not None:
+            n_k = int(X_tensor.shape[0])
+            q_k = float(batch_size) / float(n_k)
+            privacy_engine = _opacus_privacy_engine()
+            training_model, optimizer, loader = (
+                privacy_engine.make_private_with_epsilon(
+                    module=self,
+                    optimizer=optimizer,
+                    data_loader=loader,
+                    epochs=epochs,
+                    target_epsilon=float(dp_epsilon),
+                    target_delta=float(dp_delta),
+                    max_grad_norm=float(max_grad_norm),
+                    sample_rate=q_k,
+                )
+            )
         losses = []
 
         epoch_iter = tqdm(range(epochs), desc="TabDDPM training",
@@ -252,7 +347,7 @@ class TabularDiffusion(nn.Module):
                     c_batch = None
 
                 optimizer.zero_grad()
-                loss = self.compute_loss(x_batch, c_batch)
+                loss = training_model(x_batch, c_batch)
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
@@ -262,6 +357,11 @@ class TabularDiffusion(nn.Module):
             losses.append(avg_loss)
             epoch_iter.set_postfix(loss=f"{avg_loss:.4f}")
 
+        self.privacy_epsilon = None
+        self.privacy_delta = None
+        if privacy_engine is not None:
+            self.privacy_epsilon = float(privacy_engine.get_epsilon(dp_delta))
+            self.privacy_delta = float(dp_delta)
         return losses
 
     @torch.no_grad()
@@ -272,7 +372,7 @@ class TabularDiffusion(nn.Module):
         Parameters
         ----------
         n_samples : int
-        cond_vec : np.ndarray, shape (cond_dim,) or None
+        cond_vec : np.ndarray, shape (cond_dim,) or (n_samples, cond_dim) or None
         verbose : bool
 
         Returns
@@ -286,7 +386,13 @@ class TabularDiffusion(nn.Module):
         cond = None
         if cond_vec is not None and self.cond_dim > 0:
             cond = torch.tensor(cond_vec, dtype=torch.float32)
-            cond = cond.unsqueeze(0).expand(n_samples, -1)
+            if cond.ndim == 1:
+                cond = cond.unsqueeze(0).expand(n_samples, -1)
+            elif cond.ndim != 2 or cond.shape[0] != n_samples:
+                raise ValueError(
+                    "cond_vec must have shape (cond_dim,) or "
+                    "(n_samples, cond_dim)."
+                )
 
         timesteps = list(range(self.n_timesteps - 1, -1, -1))
         step_iter = tqdm(timesteps, desc="Sampling", disable=not verbose, ascii=True)
@@ -339,6 +445,255 @@ class BaseGenerator:
         raise NotImplementedError
 
 
+def _conditioning_vector(encoded, cond_mode, rng_seed=42):
+    """Same-length conditioning control for a CrossSynth network.
+
+    ``marginal`` returns the encoded aggregate. ``constant`` is a vector of
+    ones on that vector's scale. ``random`` is a seeded Gaussian, then the
+    same scale. ``none`` is a zero vector of that length. It does not change
+    ``cond_dim``.
+    """
+    encoded = np.asarray(encoded, dtype=np.float32)
+    dim = int(encoded.shape[0])
+    if cond_mode == "marginal":
+        return encoded
+    if cond_mode == "none":
+        return np.zeros(dim, dtype=np.float32)
+    if cond_mode == "constant":
+        raw = np.ones(dim, dtype=np.float32)
+    elif cond_mode == "random":
+        rng = np.random.RandomState(rng_seed)
+        raw = rng.normal(size=dim).astype(np.float32)
+    else:
+        raise ValueError(
+            f"Unknown cond_mode '{cond_mode}'. "
+            "Choose from: marginal, constant, random, none."
+        )
+    return scale_like_encoded_marginal(raw, encoded)
+
+
+def _controlled_marginal_targets(marginals_1way, marginals_2way,
+                                 cond_mode, rng_seed=42):
+    """Return real or matched-shape control workloads for calibration."""
+    if cond_mode == "none":
+        return None, None
+    rng = np.random.RandomState(rng_seed)
+
+    def _transform(items):
+        transformed = []
+        for item in items or []:
+            copied = dict(item)
+            shape = np.asarray(item["hist"]).shape
+            if cond_mode == "marginal":
+                target = np.asarray(item["hist"], dtype=np.float64).copy()
+            elif cond_mode == "constant":
+                target = np.full(shape, 1.0 / np.prod(shape))
+            elif cond_mode == "random":
+                draw = rng.gamma(shape=1.0, scale=1.0, size=shape)
+                target = draw / draw.sum()
+            else:
+                raise ValueError(f"Unknown cond_mode '{cond_mode}'.")
+            copied["hist"] = target
+            transformed.append(copied)
+        return transformed
+
+    return _transform(marginals_1way), _transform(marginals_2way)
+
+
+def _pad_condition(parts, n_rows, max_dim):
+    """Concatenate compact condition fields and pad/truncate deterministically."""
+    if parts:
+        matrix = np.column_stack(parts).astype(np.float32)
+    else:
+        matrix = np.zeros((n_rows, 0), dtype=np.float32)
+    if matrix.shape[1] > max_dim:
+        return matrix[:, :max_dim]
+    if matrix.shape[1] < max_dim:
+        padding = np.zeros(
+            (n_rows, max_dim - matrix.shape[1]), dtype=np.float32
+        )
+        matrix = np.column_stack([matrix, padding])
+    return matrix
+
+
+def _row_marginal_conditions(X, marginals_1way, marginals_2way,
+                             max_dim=256):
+    """Encode every row's cells under a released marginal workload.
+
+    A one-way query contributes a normalized bin index and the released
+    probability of that cell. A two-way query contributes two normalized bin
+    indices and the released joint-cell probability. These anchors vary by
+    row, so they cannot be folded into the denoiser bias.
+    """
+    X = np.asarray(X)
+    parts = []
+    for item in marginals_1way or []:
+        edges = np.asarray(item["edges"])
+        hist = np.asarray(item["hist"], dtype=np.float64).reshape(-1)
+        col = int(item["col"])
+        bins = np.clip(
+            np.searchsorted(edges, X[:, col], side="right") - 1,
+            0, hist.size - 1,
+        )
+        parts.extend([bins / max(hist.size - 1, 1), hist[bins]])
+
+    for item in marginals_2way or []:
+        ci, cj = (int(v) for v in item["cols"])
+        ex = np.asarray(item["edges_x"])
+        ey = np.asarray(item["edges_y"])
+        hist = np.asarray(item["hist"], dtype=np.float64)
+        bi = np.clip(
+            np.searchsorted(ex, X[:, ci], side="right") - 1,
+            0, hist.shape[0] - 1,
+        )
+        bj = np.clip(
+            np.searchsorted(ey, X[:, cj], side="right") - 1,
+            0, hist.shape[1] - 1,
+        )
+        parts.extend([
+            bi / max(hist.shape[0] - 1, 1),
+            bj / max(hist.shape[1] - 1, 1),
+            hist[bi, bj],
+        ])
+    return _pad_condition(parts, X.shape[0], max_dim)
+
+
+def _sample_marginal_conditions(marginals_1way, marginals_2way, n_samples,
+                                max_dim=256, rng_seed=42):
+    """Sample row-varying anchors solely from the released workload."""
+    rng = np.random.RandomState(rng_seed)
+    parts = []
+    for item in marginals_1way or []:
+        hist = np.asarray(item["hist"], dtype=np.float64).reshape(-1)
+        probs = np.maximum(hist, 0.0)
+        probs = probs / probs.sum() if probs.sum() > 0 else np.full(
+            hist.size, 1.0 / hist.size
+        )
+        bins = rng.choice(hist.size, size=n_samples, p=probs)
+        parts.extend([bins / max(hist.size - 1, 1), probs[bins]])
+
+    for item in marginals_2way or []:
+        hist = np.asarray(item["hist"], dtype=np.float64)
+        probs = np.maximum(hist.reshape(-1), 0.0)
+        probs = probs / probs.sum() if probs.sum() > 0 else np.full(
+            probs.size, 1.0 / probs.size
+        )
+        flat = rng.choice(probs.size, size=n_samples, p=probs)
+        bi, bj = np.unravel_index(flat, hist.shape)
+        parts.extend([
+            bi / max(hist.shape[0] - 1, 1),
+            bj / max(hist.shape[1] - 1, 1),
+            probs[flat],
+        ])
+    return _pad_condition(parts, n_samples, max_dim)
+
+
+def _condition_control(matrix, cond_mode, rng_seed=42):
+    """Create a shape-matched control for an informative anchor matrix."""
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if cond_mode == "marginal":
+        return matrix
+    if cond_mode == "none":
+        return np.zeros_like(matrix)
+    if cond_mode == "constant":
+        return np.full_like(matrix, 0.5)
+    if cond_mode == "random":
+        rng = np.random.RandomState(rng_seed)
+        return rng.uniform(0.0, 1.0, size=matrix.shape).astype(np.float32)
+    raise ValueError(f"Unknown cond_mode '{cond_mode}'.")
+
+
+def _sample_released_discrete_column(marginals_1way, column, n_samples,
+                                     rng_seed=42):
+    """Sample a discrete column using only its released one-way marginal."""
+    match = next(
+        (item for item in (marginals_1way or [])
+         if int(item["col"]) == int(column)),
+        None,
+    )
+    if match is None:
+        raise ValueError(f"No released one-way marginal for column {column}.")
+    hist = np.maximum(
+        np.asarray(match["hist"], dtype=np.float64).reshape(-1), 0.0
+    )
+    probs = hist / hist.sum() if hist.sum() > 0 else np.full(
+        hist.size, 1.0 / hist.size
+    )
+    rng = np.random.RandomState(rng_seed)
+    bins = rng.choice(hist.size, size=n_samples, p=probs)
+    edges = np.asarray(match["edges"], dtype=np.float64)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return np.rint(centers[bins]).astype(np.float32)
+
+
+def marginal_reweight_resample(X_candidates, target_1way, target_2way,
+                               n_samples, passes=5, damping=0.5,
+                               rng_seed=42):
+    """Select a synthetic shard that matches a released marginal workload.
+
+    This is deterministic post-processing up to the seeded final draw. It uses
+    iterative proportional reweighting over one- and two-way histogram cells,
+    with damped and clipped ratios to avoid a single sparse cell collapsing
+    the effective sample size.
+    """
+    X_candidates = np.asarray(X_candidates)
+    n_candidates = X_candidates.shape[0]
+    if n_candidates == 0:
+        raise ValueError("Candidate pool is empty.")
+    if not target_1way and not target_2way:
+        rng = np.random.RandomState(rng_seed)
+        index = rng.choice(n_candidates, n_samples, replace=True)
+        return X_candidates[index], float(n_candidates)
+
+    weights = np.full(n_candidates, 1.0 / n_candidates, dtype=np.float64)
+
+    def _bin_1way(item):
+        edges = np.asarray(item["edges"])
+        column = int(item["col"])
+        return np.clip(
+            np.searchsorted(edges, X_candidates[:, column], side="right") - 1,
+            0,
+            len(edges) - 2,
+        )
+
+    one_cache = [(_bin_1way(item), np.asarray(item["hist"]).reshape(-1))
+                 for item in (target_1way or [])]
+    two_cache = []
+    for item in target_2way or []:
+        ci, cj = item["cols"]
+        ex = np.asarray(item["edges_x"])
+        ey = np.asarray(item["edges_y"])
+        bi = np.clip(
+            np.searchsorted(ex, X_candidates[:, ci], side="right") - 1,
+            0, len(ex) - 2,
+        )
+        bj = np.clip(
+            np.searchsorted(ey, X_candidates[:, cj], side="right") - 1,
+            0, len(ey) - 2,
+        )
+        flat = bi * (len(ey) - 1) + bj
+        two_cache.append((flat, np.asarray(item["hist"]).reshape(-1)))
+
+    for _ in range(max(int(passes), 1)):
+        for cell_index, target in one_cache + two_cache:
+            current = np.bincount(
+                cell_index, weights=weights, minlength=target.size
+            ).astype(np.float64)
+            ratio = (target + 1e-8) / (current + 1e-8)
+            ratio = np.clip(ratio, 0.1, 10.0) ** float(damping)
+            weights *= ratio[cell_index]
+            total = weights.sum()
+            if not np.isfinite(total) or total <= 0:
+                weights.fill(1.0 / n_candidates)
+            else:
+                weights /= total
+
+    effective_sample_size = float(1.0 / np.sum(weights ** 2))
+    rng = np.random.RandomState(rng_seed)
+    chosen = rng.choice(n_candidates, n_samples, replace=True, p=weights)
+    return X_candidates[chosen], effective_sample_size
+
+
 # ===================================================================
 # 1. CrossSynth Generator (our method)
 # ===================================================================
@@ -350,12 +705,17 @@ class CrossSynthGenerator(BaseGenerator):
 
     Steps:
         1. All parties agree on shared bin edges.
-        2. Each party computes noisy 1-way marginals (Gaussian mechanism).
-        3. Noisy marginals are aggregated (simulated secure aggregation).
-        4. Aggregated marginals are encoded into a fixed-size vector.
-        5. Each party trains a local TabDDPM conditioned on this vector.
-        6. Generation: sample from each party's model using the aggregated
-           conditioning vector, then union all samples.
+        2. Each party releases one concatenated count workload. Gaussian
+           noise uses replace-one sensitivity sqrt(2 * |Q|).
+        3. Counts are rounded, then summed in-process (modular shares when
+           secure aggregation is on) and turned into one probability table.
+        4. That table is encoded as one fixed vector. constant, random, and
+           none replace it with one scaled ones vector, one scaled Gaussian,
+           or zeros, all of the same length.
+        5. Each party trains a local TabDDPM on that same vector. Private
+           training spends the remaining budget through Opacus at rate B/n_k.
+        6. Sampling uses the same vector at every step. No raw row is
+           consulted.
     """
 
     def __init__(self, hidden_dim=256, n_layers=3, n_timesteps=1000,
@@ -371,57 +731,232 @@ class CrossSynthGenerator(BaseGenerator):
         self.party_sizes = []
         self.data_mean = None
         self.data_std = None
+        self.data_means = []
+        self.data_stds = []
+        self.release_metadata = {}
+        self.target_marginals_1way = None
+        self.target_marginals_2way = None
+        self.training_conditions = []
 
     def fit(self, parties, epsilon=1.0, epochs=50, batch_size=256,
-            lr=1e-3, verbose=True, delta=1e-5, **kwargs):
+            lr=1e-3, verbose=True, delta=1e-5,
+            cond_mode="marginal", M=50, selection="domain_size",
+            eps_marginal_frac=0.5, round_counts=False,
+            marginal_mode="legacy_probability", secure_aggregation=False,
+            modulus=2_147_483_647, private_training=False,
+            delta_marginal_frac=0.5, max_grad_norm=1.0,
+            normalization="global", calibrate_output=False,
+            calibration_oversample=2.0, calibration_passes=5,
+            calibration_include_2way=True, calibration_damping=0.5,
+            categorical_indices=None, **kwargs):
         """
         Train CrossSynth across all parties.
 
         Privacy budget allocation:
-            - epsilon/2 for marginal computation
-            - epsilon/2 for local training (no additional DP on gradients
-              since the marginals are the only shared information)
+            - eps_marginal_frac * epsilon for the count workload.
+              This argument still defaults to 0.5 for older callers.
+              The paper CLI passes 0.1.
+            - delta_marginal_frac * delta for that same workload.
+              This argument still defaults to 0.5 for older callers.
+              The paper CLI passes 0.1.
+            - the complement is the private training budget when
+              private_training is true
+
+        cond_mode:
+            marginal — one encoded aggregate (default)
+            constant — one scaled vector of ones, same length
+            random   — one scaled Gaussian draw, same length
+            none     — one zero vector, same length
         """
         K = len(parties)
         d = parties[0]["X"].shape[1]
-        eps_marginals = epsilon / 2.0
+        if cond_mode not in ("marginal", "constant", "random", "none"):
+            raise ValueError(
+                f"Unknown cond_mode '{cond_mode}'. "
+                "Choose from: marginal, constant, random, none."
+            )
+        if selection not in ("domain_size", "random"):
+            raise ValueError(
+                f"Unknown selection '{selection}'. "
+                "Choose from: domain_size, random."
+            )
+        if marginal_mode not in ("legacy_probability", "count"):
+            raise ValueError(
+                "marginal_mode must be 'legacy_probability' or 'count'."
+            )
+        if not 0.0 < eps_marginal_frac < 1.0:
+            raise ValueError("eps_marginal_frac must lie strictly between 0 and 1.")
+        if not 0.0 < delta_marginal_frac < 1.0:
+            raise ValueError("delta_marginal_frac must lie strictly between 0 and 1.")
+        if normalization not in ("global", "local"):
+            raise ValueError("normalization must be 'global' or 'local'.")
+        if secure_aggregation and not round_counts:
+            raise ValueError(
+                "Modular secure aggregation requires round_counts=True."
+            )
+        # The paper CLI passes 0.1 on the count release and 0.9 on training.
+        eps_marginals = epsilon * eps_marginal_frac
+        eps_training = epsilon * (1.0 - eps_marginal_frac)
+        delta_marginals = delta * delta_marginal_frac
+        delta_training = delta * (1.0 - delta_marginal_frac)
 
         print(f"[CrossSynth] Training with K={K} parties, eps={epsilon}, "
-              f"d={d}, epochs={epochs}")
+              f"d={d}, epochs={epochs}, cond_mode={cond_mode}, "
+              f"M={M}, selection={selection}")
 
         # Step 1: Agree on shared bin edges
-        shared_edges = compute_shared_bin_edges(parties, n_bins=self.n_bins)
+        self.categorical_indices = sorted(set(categorical_indices or []))
+        shared_edges = compute_shared_bin_edges(
+            parties, n_bins=self.n_bins,
+            categorical_indices=self.categorical_indices,
+        )
+        self.shared_edges = shared_edges
+        domain_sizes = column_domain_sizes(shared_edges)
+        self.selected_pairs = select_2way_pairs(
+            d, M=M, selection=selection, domain_sizes=domain_sizes,
+        )
+        self.cond_mode = cond_mode
 
-        # Step 2: Each party computes noisy 1-way marginals
         all_noisy_marginals = []
-        for k in range(K):
-            m1 = compute_1way_marginals_shared(parties[k]["X"], shared_edges)
-            m1_noisy = add_dp_noise_1way(
-                m1, n_samples=parties[k]["X"].shape[0],
-                epsilon=eps_marginals, delta=delta
+        all_noisy_2way = []
+        release_sigmas = []
+        release_sensitivity = None
+        if marginal_mode == "legacy_probability":
+            # Historical probability-space path retained for reproducibility.
+            # Finish every one-way draw before any two-way draw so its random
+            # sequence remains compatible with the earlier runner.
+            for k in range(K):
+                m1 = compute_1way_marginals_shared(
+                    parties[k]["X"], shared_edges
+                )
+                all_noisy_marginals.append(add_dp_noise_1way(
+                    m1, n_samples=parties[k]["X"].shape[0],
+                    epsilon=eps_marginals, delta=delta,
+                ))
+            for k in range(K):
+                m2 = compute_2way_marginals_shared(
+                    parties[k]["X"], self.selected_pairs, shared_edges
+                )
+                all_noisy_2way.append(add_dp_noise_2way(
+                    m2, n_samples=parties[k]["X"].shape[0],
+                    epsilon=eps_marginals, delta=delta,
+                ) if m2 else [])
+            if round_counts:
+                all_noisy_marginals = [
+                    maybe_round_count_hists(m, True)
+                    for m in all_noisy_marginals
+                ]
+                all_noisy_2way = [
+                    maybe_round_count_hists(m, True)
+                    for m in all_noisy_2way
+                ]
+            agg_marginals = aggregate_marginals_1way(all_noisy_marginals)
+            agg_2way = (
+                aggregate_marginals_2way(all_noisy_2way)
+                if self.selected_pairs else None
             )
-            all_noisy_marginals.append(m1_noisy)
+        else:
+            # Manuscript path: release a single concatenated count workload.
+            for k in range(K):
+                m1 = compute_1way_counts_shared(
+                    parties[k]["X"], shared_edges
+                )
+                m2 = compute_2way_counts_shared(
+                    parties[k]["X"], self.selected_pairs, shared_edges
+                )
+                noisy_1, noisy_2, sigma, sensitivity = (
+                    add_dp_noise_count_queries(
+                        m1, m2, epsilon=eps_marginals,
+                        delta=delta_marginals,
+                    )
+                )
+                all_noisy_marginals.append(
+                    maybe_round_count_hists(noisy_1, round_counts)
+                )
+                all_noisy_2way.append(
+                    maybe_round_count_hists(noisy_2, round_counts)
+                )
+                release_sigmas.append(sigma)
+                release_sensitivity = sensitivity
+            agg_marginals, agg_2way = aggregate_count_queries(
+                all_noisy_marginals,
+                all_noisy_2way,
+                secure=secure_aggregation,
+                modulus=modulus,
+            )
 
-        # Step 3: Aggregate marginals
-        agg_marginals = aggregate_marginals_1way(all_noisy_marginals)
+        # One fixed vector. constant / random / none stay the same length
+        # and do not vary by row.
+        encoded = encode_marginals(
+            agg_marginals, marginals_2way=agg_2way, max_dim=self.cond_dim
+        )
+        self.cond_vec = _conditioning_vector(encoded, cond_mode)
+        self.target_marginals_1way, self.target_marginals_2way = (
+            _controlled_marginal_targets(
+                agg_marginals, agg_2way, cond_mode=cond_mode,
+            )
+        )
+        self.calibrate_output = bool(calibrate_output)
+        self.calibration_oversample = max(float(calibration_oversample), 1.0)
+        self.calibration_passes = max(int(calibration_passes), 1)
+        self.calibration_include_2way = bool(calibration_include_2way)
+        self.calibration_damping = float(calibration_damping)
+        self.training_conditions = [self.cond_vec for _ in range(K)]
 
-        # Step 4: Encode into conditioning vector
-        self.cond_vec = encode_marginals(agg_marginals, max_dim=self.cond_dim)
+        self.normalization = normalization
+        self.data_means = []
+        self.data_stds = []
+        if normalization == "global":
+            X_all_parts = np.concatenate([p["X"] for p in parties], axis=0)
+            self.data_mean = X_all_parts.mean(axis=0).astype(np.float32)
+            self.data_std = X_all_parts.std(axis=0).astype(np.float32)
+            self.data_std[self.data_std < 1e-8] = 1.0
+            self.data_means = [self.data_mean for _ in parties]
+            self.data_stds = [self.data_std for _ in parties]
+        else:
+            for party in parties:
+                mean = party["X"].mean(axis=0).astype(np.float32)
+                std = party["X"].std(axis=0).astype(np.float32)
+                std[std < 1e-8] = 1.0
+                self.data_means.append(mean)
+                self.data_stds.append(std)
+            self.data_mean = None
+            self.data_std = None
 
-        # Normalize ALL features for diffusion training (zero mean, unit std).
-        # Categorical features are label-encoded integers and need scaling too.
-        X_all_parts = np.concatenate([p["X"] for p in parties], axis=0)
-        self.data_mean = X_all_parts.mean(axis=0).astype(np.float32)
-        self.data_std = X_all_parts.std(axis=0).astype(np.float32)
-        self.data_std[self.data_std < 1e-8] = 1.0
+        n_bins_released = sum(item["hist"].size for item in agg_marginals)
+        n_bins_released += sum(item["hist"].size for item in (agg_2way or []))
+        self.release_metadata = {
+            "marginal_mode": marginal_mode,
+            "query_count": int(d + len(self.selected_pairs)),
+            "released_bins": int(n_bins_released),
+            "selected_pairs": [list(pair) for pair in self.selected_pairs],
+            "epsilon_marginals": float(eps_marginals),
+            "epsilon_training": float(eps_training),
+            "delta_marginals": float(delta_marginals),
+            "delta_training": float(delta_training),
+            "count_sensitivity": release_sensitivity,
+            "count_sigma": release_sigmas[0] if release_sigmas else None,
+            "rounded": bool(round_counts),
+            "secure_aggregation": bool(secure_aggregation),
+            "modulus": int(modulus) if secure_aggregation else None,
+            "normalization": normalization,
+            "calibrate_output": bool(calibrate_output),
+            "calibration_oversample": float(self.calibration_oversample),
+            "calibration_passes": int(self.calibration_passes),
+            "calibration_include_2way": bool(self.calibration_include_2way),
+            "calibration_damping": float(self.calibration_damping),
+        }
 
-        # Step 5: Each party trains a local conditioned diffusion model
+        # Step 5: Each party trains a local conditioned diffusion model.
+        # The paper profile applies the complementary budget through Opacus.
         self.models = []
         self.party_sizes = []
 
         for k in range(K):
             print(f"  Party {k}/{K}: {parties[k]['X'].shape[0]} samples")
-            X_norm = (parties[k]["X"] - self.data_mean) / self.data_std
+            X_norm = (
+                parties[k]["X"] - self.data_means[k]
+            ) / self.data_stds[k]
             model = TabularDiffusion(
                 input_dim=d,
                 cond_dim=self.cond_dim,
@@ -436,9 +971,17 @@ class CrossSynthGenerator(BaseGenerator):
                 batch_size=batch_size,
                 lr=lr,
                 verbose=verbose,
+                dp_epsilon=eps_training if private_training else None,
+                dp_delta=delta_training,
+                max_grad_norm=max_grad_norm,
             )
             self.models.append(model)
             self.party_sizes.append(parties[k]["X"].shape[0])
+
+        self.release_metadata["private_training"] = bool(private_training)
+        self.release_metadata["achieved_training_epsilons"] = [
+            getattr(model, "privacy_epsilon", None) for model in self.models
+        ]
 
         print(f"[CrossSynth] Training complete.")
 
@@ -458,8 +1001,35 @@ class CrossSynthGenerator(BaseGenerator):
             n_k = int(round(n_samples * self.party_sizes[k] / total))
             if n_k == 0:
                 n_k = 1
-            samples = model.sample(n_k, cond_vec=self.cond_vec, verbose=False)
-            samples = samples * self.data_std + self.data_mean
+            n_candidates = (
+                int(math.ceil(n_k * self.calibration_oversample))
+                if self.calibrate_output else n_k
+            )
+            samples = model.sample(
+                n_candidates, cond_vec=self.cond_vec, verbose=False
+            )
+            samples = samples * self.data_stds[k] + self.data_means[k]
+            for col in self.categorical_indices:
+                edges = self.shared_edges[col]
+                lower = float(edges[0] + 0.5)
+                upper = float(edges[-1] - 0.5)
+                samples[:, col] = np.clip(
+                    np.rint(samples[:, col]), lower, upper
+                )
+            if self.calibrate_output:
+                samples, ess = marginal_reweight_resample(
+                    samples,
+                    self.target_marginals_1way,
+                    (self.target_marginals_2way
+                     if self.calibration_include_2way else None),
+                    n_samples=n_k,
+                    passes=self.calibration_passes,
+                    damping=self.calibration_damping,
+                    rng_seed=42 + k,
+                )
+                self.release_metadata.setdefault(
+                    "calibration_effective_sample_sizes", []
+                ).append(float(ess))
             all_samples.append(samples)
 
         result = np.concatenate(all_samples, axis=0)
@@ -476,7 +1046,137 @@ class CrossSynthGenerator(BaseGenerator):
 
 
 # ===================================================================
-# 2. Independent Generator (no cross-party info)
+# 2. Federated parameter averaging (communication baseline)
+# ===================================================================
+
+class FedAvgGenerator(BaseGenerator):
+    """Federated diffusion training with optional delta compression.
+
+    This baseline is intentionally separate from CrossSynth: it communicates
+    model deltas for several rounds. ``int8`` applies symmetric per-tensor
+    quantisation before aggregation; ``none`` sends dense float32 deltas.
+    """
+
+    def __init__(self, hidden_dim=256, n_layers=3, n_timesteps=1000,
+                 rounds=20, local_epochs=1, compression="none"):
+        super().__init__(name=f"FedAvg-{compression}")
+        if compression not in ("none", "int8"):
+            raise ValueError("compression must be 'none' or 'int8'.")
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.n_timesteps = n_timesteps
+        self.rounds = int(rounds)
+        self.local_epochs = int(local_epochs)
+        self.compression = compression
+        self.model = None
+        self.communication_metadata = {}
+
+    @staticmethod
+    def _compress(delta, compression):
+        if compression == "none":
+            return delta, delta.numel() * 4
+        max_abs = float(delta.abs().max())
+        if max_abs == 0.0:
+            return torch.zeros_like(delta), delta.numel() + 4
+        scale = max_abs / 127.0
+        quantized = torch.clamp(torch.round(delta / scale), -127, 127)
+        return quantized * scale, delta.numel() + 4
+
+    def fit(self, parties, epsilon=1.0, epochs=None, batch_size=256,
+            lr=1e-3, verbose=True, **kwargs):
+        del epsilon
+        K = len(parties)
+        d = parties[0]["X"].shape[1]
+        if epochs is not None:
+            total_local_epochs = max(int(epochs), 1)
+            rounds = min(self.rounds, total_local_epochs)
+            local_epochs = max(total_local_epochs // rounds, 1)
+        else:
+            rounds = self.rounds
+            local_epochs = self.local_epochs
+
+        pooled = np.concatenate([party["X"] for party in parties], axis=0)
+        self.data_mean = pooled.mean(axis=0).astype(np.float32)
+        self.data_std = pooled.std(axis=0).astype(np.float32)
+        self.data_std[self.data_std < 1e-8] = 1.0
+        self.model = TabularDiffusion(
+            input_dim=d,
+            cond_dim=0,
+            hidden_dim=self.hidden_dim,
+            n_layers=self.n_layers,
+            n_timesteps=self.n_timesteps,
+        )
+        transmitted_per_party = 0
+        party_weights = np.asarray(
+            [party["X"].shape[0] for party in parties], dtype=np.float64
+        )
+        party_weights /= party_weights.sum()
+
+        for round_idx in range(rounds):
+            base_state = copy.deepcopy(self.model.state_dict())
+            parameter_deltas = []
+            round_bytes = []
+            for party in parties:
+                local_model = TabularDiffusion(
+                    input_dim=d,
+                    cond_dim=0,
+                    hidden_dim=self.hidden_dim,
+                    n_layers=self.n_layers,
+                    n_timesteps=self.n_timesteps,
+                )
+                local_model.load_state_dict(base_state)
+                normalized = (party["X"] - self.data_mean) / self.data_std
+                local_model.train_model(
+                    normalized,
+                    epochs=local_epochs,
+                    batch_size=min(batch_size, normalized.shape[0]),
+                    lr=lr,
+                    verbose=False,
+                )
+                deltas = {}
+                bytes_sent = 0
+                for name, parameter in local_model.named_parameters():
+                    delta = parameter.detach() - base_state[name]
+                    reconstructed, n_bytes = self._compress(
+                        delta, self.compression
+                    )
+                    deltas[name] = reconstructed
+                    bytes_sent += n_bytes
+                parameter_deltas.append(deltas)
+                round_bytes.append(bytes_sent)
+
+            updated = copy.deepcopy(base_state)
+            for name, _ in self.model.named_parameters():
+                average_delta = sum(
+                    float(party_weights[k]) * parameter_deltas[k][name]
+                    for k in range(K)
+                )
+                updated[name] = base_state[name] + average_delta
+            self.model.load_state_dict(updated)
+            transmitted_per_party += int(np.mean(round_bytes))
+            if verbose:
+                print(f"[FedAvg-{self.compression}] round "
+                      f"{round_idx + 1}/{rounds}")
+
+        parameter_count = sum(p.numel() for p in self.model.parameters())
+        self.communication_metadata = {
+            "compression": self.compression,
+            "rounds": int(rounds),
+            "local_epochs": int(local_epochs),
+            "parameter_count": int(parameter_count),
+            "bytes_per_party_total_upload": int(transmitted_per_party),
+            "bytes_network_total_upload": int(transmitted_per_party * K),
+        }
+
+    def generate(self, n_samples):
+        if self.model is None:
+            raise RuntimeError("Must call .fit() before .generate()")
+        samples = self.model.sample(n_samples, verbose=False)
+        return samples * self.data_std + self.data_mean
+
+
+# ===================================================================
+# 3. Independent Generator (no cross-party info)
 # ===================================================================
 
 class IndependentGenerator(BaseGenerator):
@@ -494,26 +1194,45 @@ class IndependentGenerator(BaseGenerator):
         self.party_sizes = []
         self.data_mean = None
         self.data_std = None
+        self.data_means = []
+        self.data_stds = []
 
     def fit(self, parties, epsilon=1.0, epochs=50, batch_size=256,
-            lr=1e-3, verbose=True, **kwargs):
+            lr=1e-3, verbose=True, private_training=False,
+            delta=1e-5, max_grad_norm=1.0,
+            normalization="global", **kwargs):
         K = len(parties)
         d = parties[0]["X"].shape[1]
         print(f"[Independent] Training with K={K} parties, eps={epsilon}, "
               f"d={d}, epochs={epochs}")
 
-        # Normalize ALL features for diffusion training (zero mean, unit std)
-        X_all_parts = np.concatenate([p["X"] for p in parties], axis=0)
-        self.data_mean = X_all_parts.mean(axis=0).astype(np.float32)
-        self.data_std = X_all_parts.std(axis=0).astype(np.float32)
-        self.data_std[self.data_std < 1e-8] = 1.0
+        self.data_means = []
+        self.data_stds = []
+        if normalization == "global":
+            X_all_parts = np.concatenate([p["X"] for p in parties], axis=0)
+            self.data_mean = X_all_parts.mean(axis=0).astype(np.float32)
+            self.data_std = X_all_parts.std(axis=0).astype(np.float32)
+            self.data_std[self.data_std < 1e-8] = 1.0
+            self.data_means = [self.data_mean for _ in parties]
+            self.data_stds = [self.data_std for _ in parties]
+        elif normalization == "local":
+            for party in parties:
+                mean = party["X"].mean(axis=0).astype(np.float32)
+                std = party["X"].std(axis=0).astype(np.float32)
+                std[std < 1e-8] = 1.0
+                self.data_means.append(mean)
+                self.data_stds.append(std)
+        else:
+            raise ValueError("normalization must be 'global' or 'local'.")
 
         self.models = []
         self.party_sizes = []
 
         for k in range(K):
             print(f"  Party {k}/{K}: {parties[k]['X'].shape[0]} samples")
-            X_norm = (parties[k]["X"] - self.data_mean) / self.data_std
+            X_norm = (
+                parties[k]["X"] - self.data_means[k]
+            ) / self.data_stds[k]
             model = TabularDiffusion(
                 input_dim=d,
                 cond_dim=0,  # No conditioning
@@ -527,6 +1246,9 @@ class IndependentGenerator(BaseGenerator):
                 batch_size=batch_size,
                 lr=lr,
                 verbose=verbose,
+                dp_epsilon=epsilon if private_training else None,
+                dp_delta=delta,
+                max_grad_norm=max_grad_norm,
             )
             self.models.append(model)
             self.party_sizes.append(parties[k]["X"].shape[0])
@@ -545,7 +1267,7 @@ class IndependentGenerator(BaseGenerator):
             if n_k == 0:
                 n_k = 1
             samples = model.sample(n_k, verbose=False)
-            samples = samples * self.data_std + self.data_mean
+            samples = samples * self.data_stds[k] + self.data_means[k]
             all_samples.append(samples)
 
         result = np.concatenate(all_samples, axis=0)
@@ -1025,7 +1747,8 @@ def get_generator(name, **kwargs):
     Parameters
     ----------
     name : str
-        One of: 'fedsynth', 'independent', 'centralized', 'privbayes', 'ctgan'
+        One of: 'fedsynth', 'fedavg', 'fedavg_8bit', 'independent',
+        'centralized', 'privbayes', 'ctgan'
 
     Returns
     -------
@@ -1035,6 +1758,10 @@ def get_generator(name, **kwargs):
 
     if name_lower == "fedsynth":
         return CrossSynthGenerator(**kwargs)
+    elif name_lower == "fedavg":
+        return FedAvgGenerator(compression="none", **kwargs)
+    elif name_lower in ("fedavg8bit", "8bitfedavg"):
+        return FedAvgGenerator(compression="int8", **kwargs)
     elif name_lower == "independent":
         return IndependentGenerator(**kwargs)
     elif name_lower == "centralized":
@@ -1046,7 +1773,8 @@ def get_generator(name, **kwargs):
     else:
         raise ValueError(
             f"Unknown generator '{name}'. "
-            f"Choose from: fedsynth, independent, centralized, privbayes, ctgan"
+            "Choose from: fedsynth, fedavg, fedavg_8bit, independent, "
+            "centralized, privbayes, ctgan"
         )
 
 
