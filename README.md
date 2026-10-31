@@ -94,7 +94,8 @@ docs/figures/                figures used in this README
 ## Notes
 
 - The CLI default is the `paper` profile. `--profile legacy` is a different protocol (probability-space noise, no calibration) and must not be mixed into the same result table.
+- The paper profile uses a one-tenth count-release share, integer rounding, and additive secret sharing over the public prime \(2^{31}-1\).
 - Calibration is one damped pass (`0.1`, clip `[0.1, 10]`) on a two-times candidate pool. It uses the released one-way marginals only.
-- `cond_mode` selects a real marginal target or a same-shape constant, random, or absent control. Under `paper`, that target feeds both the fixed network input and the calibration pass.
+- `cond_mode` selects a real marginal target or a same-shape constant, random, or absent control. Under `paper`, that target feeds both the fixed network input and the calibration pass. The `none` control is a zero vector of unchanged length.
 - Count-vector sensitivity is replace-one in count space and does not scale with shard length. A published synthetic table can still reveal each shard's output length.
 - No proprietary datasets are bundled. OpenML downloads go to the local sklearn cache.
